@@ -1,0 +1,11 @@
+# local secrets / overrides
+mise.local.toml
+.env
+.token_cache.json
+
+# crawler output
+subjects/
+
+# python / uv
+__pycache__/
+.venv/

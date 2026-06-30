@@ -1,0 +1,41 @@
+[tools]
+python = "3.14.3"
+uv = "latest"
+
+# This file is shared/committed: keep PLACEHOLDER values only.
+# Put the real secrets in mise.local.toml (gitignored) — mise auto-loads it and
+# its values override the placeholders below. Structure mirrors mise.local.toml.
+[env]
+# === API auth (api.intra.42.fr) — choose ONE of A or B ===
+# A) You already have an ACCESS TOKEN (64-hex, no prefix; expires ~2h):
+# INTRA_TOKEN = "your-access-token"
+#
+# B) You have the app's CLIENT credentials (the crawler auto-mints a token):
+#    client_id  starts with u-s4t2...   client_secret starts with s-s4t2...
+INTRA_CLIENT_ID     = "REPLACE_WITH_u-s4t2..."
+INTRA_CLIENT_SECRET = "REPLACE_WITH_s-s4t2..."
+
+# === Listing target (app tokens can't use /v2/me) ===
+INTRA_LOGIN     = "REPLACE_WITH_42_LOGIN"      # your 42 login
+INTRA_CURSUS_ID = "21"                         # 21 = 42cursus (common core), 1 = old 42
+
+# === PDF download (projects.intra.42.fr) ===
+# _intra_42_session_production cookie from a logged-in browser:
+# DevTools > Application > Cookies > https://projects.intra.42.fr > _intra_42_session_production
+INTRA_SESSION = "REPLACE_WITH_INTRA_42_SESSION_COOKIE"
+
+[tasks.dry]
+description = "Dry run: list ALL projects + resolve subject.pdf URLs (no download)"
+run = "uv run crawler.py --all --dry-run --limit 5"
+
+[tasks.run]
+description = "Download ALL subject.pdf into ./subjects (no registration filter)"
+run = "uv run crawler.py --all --out subjects"
+
+[tasks.run-not-registered]
+description = "Download only Not-registered subject.pdf into ./subjects"
+run = "uv run crawler.py --out subjects"
+
+[tasks.clean]
+description = "Remove downloaded subjects"
+run = "rm -rf subjects"

@@ -5,6 +5,7 @@ mise.local.toml
 
 # crawler output
 subjects/
+subjects
 
 # python / uv
 __pycache__/

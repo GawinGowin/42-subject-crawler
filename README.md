@@ -47,9 +47,21 @@ INTRA_TOKEN=xxxxx INTRA_SESSION=yyyyy uv run crawler.py --out subjects
 | `--all` | off | Drop the "not registered" filter and fetch ALL projects |
 | `--limit N` | none | Process only the first N projects (for trial runs) |
 | `--dry-run` | off | List + resolve PDF URLs only. No download (no cookie needed) |
+| `--adopt-existing` | off | Index PDFs already on disk into the manifest instead of re-downloading them |
+| `--force` | off | Re-download every `subject.pdf`, ignoring the manifest |
 
 ## Behavior notes
-- An existing `subject.pdf` is skipped (re-runs only fetch the delta).
+- `<out>/manifest.json` records, per project, the CDN URL each `subject.pdf` was
+  downloaded from, plus `sha256` / `size` / `etag` / `last_modified` / `fetched_at`.
+  A re-run downloads a subject again only when the URL on the detail page no longer
+  matches the recorded one — that URL carries the storage key, so it changes when
+  the subject is re-uploaded. Everything else is skipped as "up to date".
+- The manifest is rewritten after every download, so an interrupted run keeps what
+  it already fetched. Downloads go through a `.part` file and are renamed into place.
+- For a `subjects/` directory filled in before the manifest existed, one run with
+  `--adopt-existing` indexes those files (hashing them, taking the current URL on
+  trust) so that later updates are detected without re-downloading everything now.
+  Without the flag those files are simply re-downloaded once.
 - Projects without a `subject.pdf`, and failed projects, are listed in the final summary.
 - Explicit errors are raised on: 401 (API) → `INTRA_TOKEN` expired; redirect to sign-in → `INTRA_SESSION` expired.
 - Rate limiting (429/5xx) and network errors are retried automatically with exponential backoff.

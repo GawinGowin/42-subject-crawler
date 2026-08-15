@@ -14,6 +14,10 @@ Two-source hybrid:
   * subject.pdf URL extraction + download -> HTML of projects.intra.42.fr
     (the subject.pdf link is NOT exposed by the API, so HTML parsing is required)
 
+Re-runs are incremental: <out>/manifest.json records the CDN URL (plus sha256,
+size, ETag/Last-Modified) each subject.pdf came from, and a subject is
+re-downloaded when that URL no longer matches the one on the detail page.
+
 Credentials (read from env, never hardcoded):
   INTRA_TOKEN    Bearer token for api.intra.42.fr (used for the listing step).
   INTRA_SESSION  Value of the `_intra_42_session_production` cookie from a
@@ -25,6 +29,7 @@ Run with uv (auto-installs deps):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -217,22 +222,114 @@ def get_pdf_url_for_slug(
     return urljoin(resp.url, pdf) if pdf else None
 
 
-def download_pdf(web: requests.Session, url: str, dest: Path, *, delay: float) -> bool:
+def download_pdf(
+    web: requests.Session, url: str, dest: Path, *, delay: float
+) -> dict | None:
+    """Download `url` to `dest`, returning its manifest record (None on failure).
+
+    Written to a .part file first so an interrupted run never leaves a truncated
+    subject.pdf that the next run would treat as complete.
+    """
     resp = request_with_retry(
         web, "GET", url, delay=delay, allow_redirects=True, stream=True
     )
     if resp.status_code != 200:
         log(f"  ! download HTTP {resp.status_code}: {url}")
-        return False
+        return None
     ctype = resp.headers.get("Content-Type", "")
     if "pdf" not in ctype.lower():
         log(f"  ! not a pdf (Content-Type: {ctype}): {url}")
-        return False
+        return None
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with open(dest, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=65536):
-            f.write(chunk)
-    return True
+    tmp = dest.with_name(dest.name + ".part")
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with open(tmp, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                digest.update(chunk)
+                size += len(chunk)
+                f.write(chunk)
+        tmp.replace(dest)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return {
+        "url": url,
+        "etag": resp.headers.get("ETag"),
+        "last_modified": resp.headers.get("Last-Modified"),
+        "size": size,
+        "sha256": digest.hexdigest(),
+        "fetched_at": utcnow(),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Manifest: what we downloaded, and from which URL
+# --------------------------------------------------------------------------- #
+# The subject.pdf is served from an ActiveStorage-backed CDN URL that changes
+# whenever the file is re-uploaded, so a URL mismatch means the subject was
+# updated upstream. Without this record the only freshness signal is "a local
+# file exists", which never expires.
+MANIFEST_NAME = "manifest.json"
+
+
+def utcnow() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def load_manifest(out_dir: Path) -> dict[str, dict]:
+    """Read out_dir/manifest.json; a missing or corrupt file just means 'nothing
+    known yet' (the PDFs on disk are still adoptable via --adopt-existing)."""
+    path = out_dir / MANIFEST_NAME
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        log(f"! ignoring unreadable {path} ({e}); it will be rewritten")
+        return {}
+    if not isinstance(data, dict):
+        log(f"! ignoring malformed {path}; it will be rewritten")
+        return {}
+    return {k: v for k, v in data.items() if isinstance(v, dict)}
+
+
+def save_manifest(out_dir: Path, manifest: dict[str, dict]) -> None:
+    """Atomically rewrite the manifest (called after every change so an
+    interrupted run keeps what it already fetched)."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / MANIFEST_NAME
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    )
+    tmp.replace(path)
+
+
+def record_existing(dest: Path, url: str) -> dict:
+    """Manifest record for a PDF already on disk (--adopt-existing).
+
+    The URL is taken on trust: we cannot tell whether the local copy came from
+    it, only that from now on a *change* of URL will be noticed.
+    """
+    digest = hashlib.sha256()
+    size = 0
+    with open(dest, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            digest.update(chunk)
+            size += len(chunk)
+    return {
+        "url": url,
+        "etag": None,
+        "last_modified": None,
+        "size": size,
+        "sha256": digest.hexdigest(),
+        "fetched_at": None,  # unknown: adopted, not downloaded
+        "adopted_at": utcnow(),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -362,6 +459,17 @@ def main() -> int:
         action="store_true",
         help="list + resolve pdf URLs but do not download",
     )
+    ap.add_argument(
+        "--adopt-existing",
+        action="store_true",
+        help="index PDFs already on disk into the manifest instead of "
+        "re-downloading them (first run after adding the manifest)",
+    )
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help="re-download every subject.pdf even if the manifest says it is current",
+    )
     args = ap.parse_args()
 
     cookie = os.environ.get("INTRA_SESSION", "").strip()
@@ -396,7 +504,8 @@ def main() -> int:
         projects = projects[: args.limit]
 
     out_dir = Path(args.out)
-    downloaded, no_pdf, failed = [], [], []
+    manifest = load_manifest(out_dir)
+    fetched, updated, current, adopted, no_pdf, failed = [], [], [], [], [], []
 
     log("== Step 2: resolving + downloading subject.pdf via HTML ==")
     for i, p in enumerate(projects, 1):
@@ -416,24 +525,49 @@ def main() -> int:
             continue
         log(f"  -> {pdf_url}")
         if args.dry_run:
-            downloaded.append(slug)
+            fetched.append(slug)
             continue
+
         dest = out_dir / slug / "subject.pdf"
-        if dest.exists():
-            log("  = already downloaded, skip")
-            downloaded.append(slug)
+        existed = dest.exists()
+        known = manifest.get(slug) if existed else None
+        if known and not args.force:
+            if known.get("url") == pdf_url:
+                log("  = up to date, skip")
+                current.append(slug)
+                continue
+            log(f"  ~ subject URL changed since {known.get('fetched_at') or 'adoption'}")
+        elif existed and args.adopt_existing and not args.force:
+            # Local file predates the manifest: record it so the *next* URL
+            # change is detected, without spending a download now.
+            manifest[slug] = record_existing(dest, pdf_url)
+            save_manifest(out_dir, manifest)
+            log("  = adopted existing file into manifest")
+            adopted.append(slug)
             continue
-        if download_pdf(web, pdf_url, dest, delay=args.delay):
-            log(f"  saved {dest}")
-            downloaded.append(slug)
-        else:
+
+        record = download_pdf(web, pdf_url, dest, delay=args.delay)
+        if record is None:
             failed.append(slug)
+            continue
+        if known and known.get("sha256") == record["sha256"]:
+            log("  (same content, only the URL changed)")
+        manifest[slug] = record
+        save_manifest(out_dir, manifest)
+        log(f"  {'updated' if existed else 'saved'} {dest}")
+        (updated if existed else fetched).append(slug)
 
     log("\n==================== SUMMARY ====================")
-    log(f"  downloaded/ok : {len(downloaded)}")
+    log(f"  new           : {len(fetched)}")
+    log(f"  updated       : {len(updated)}  {updated if updated else ''}")
+    log(f"  up to date    : {len(current)}")
+    if adopted:
+        log(f"  adopted       : {len(adopted)}")
     log(f"  no subject.pdf: {len(no_pdf)}  {no_pdf if no_pdf else ''}")
     log(f"  failed        : {len(failed)}  {failed if failed else ''}")
     log(f"  output dir    : {out_dir.resolve()}")
+    if not args.dry_run:
+        log(f"  manifest      : {(out_dir / MANIFEST_NAME).resolve()}")
     return 1 if failed else 0
 
 

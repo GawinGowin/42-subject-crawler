@@ -47,9 +47,20 @@ INTRA_TOKEN=xxxxx INTRA_SESSION=yyyyy uv run crawler.py --out subjects
 | `--all` | off | 「Not registered」フィルターを外して全プロジェクトを取得 |
 | `--limit N` | なし | 先頭 N 件だけ処理（試走用） |
 | `--dry-run` | off | 一覧とPDF URL解決のみ。DLしない（Cookie不要） |
+| `--adopt-existing` | off | 既にディスクにある PDF を再DLせず manifest に取り込む |
+| `--force` | off | manifest を無視して全ての `subject.pdf` を再取得 |
 
 ## 挙動メモ
-- 既に存在する `subject.pdf` はスキップ（再実行で差分のみ）。
+- `<out>/manifest.json` に、各 `subject.pdf` をどの CDN URL から取得したかを
+  `sha256` / `size` / `etag` / `last_modified` / `fetched_at` とともに記録する。
+  再実行時は、詳細ページ上の URL が記録と一致しない課題だけを再取得する
+  （この URL はストレージキーを含むため、subject が再アップロードされると変わる）。
+  一致するものは "up to date" としてスキップ。
+- manifest は1件DLするごとに書き出すので、途中で中断しても取得済みの分は残る。
+  DL 自体も `.part` に書いてから rename する。
+- manifest 導入前に溜めた `subjects/` は、一度 `--adopt-existing` で実行すると
+  既存ファイルを（ハッシュを取り、現在の URL を正として）取り込むので、
+  いま全部再DLせずに以降の更新だけを検知できる。フラグ無しなら一度だけ再DLされる。
 - `subject.pdf` が無い課題・失敗した課題は最後のサマリに一覧表示。
 - 401（API）→ `INTRA_TOKEN` 失効、sign-in リダイレクト → `INTRA_SESSION` 失効、を明示エラーで通知。
 - レート制限（429/5xx）は指数バックオフで自動リトライ。
